@@ -39,25 +39,41 @@ class OfflineError(RuntimeError):
 # ----------------------------------------------------------------------
 
 PROMPT_FIND_FIGURES = """\
-This is a rendered page from a scientific paper. Identify every figure on
-the page (plots, micrographs, schematics -- not tables, not equations).
+This is a rendered page from an integrated-photonics / silicon-photonics paper
+(novel devices such as MMIs, grating couplers, ring resonators, modulators, etc.).
+Identify every figure on the page (plots, micrographs, schematics, layout
+drawings -- not tables, not equations).
 Return STRICT JSON, no prose:
 {"figures": [{"bbox": [x0, y0, x1, y1], "kind": "line_plot|micrograph|schematic|other",
               "looks_like_spectrum": true|false}]}
 bbox is in pixels of this image, origin top-left. Image size: {width}x{height}.
+
+Set looks_like_spectrum=true only for line plots of a device performance
+metric vs wavelength, frequency, or another continuous axis suitable for
+curve digitization (e.g. transmission, insertion loss, reflection, coupling
+efficiency, S21/S11, extinction ratio). Set false for schematics, SEM/optical
+micrographs, layout/GDS drawings, mode/field plots, eye diagrams, histograms,
+and discrete bar charts.
 """
 
 PROMPT_CLASSIFY_FIGURE = """\
-This image is a figure from a materials-science paper. Return STRICT JSON:
+This image is a figure from an integrated-photonics device paper (MMIs,
+grating couplers, resonators, modulators, photonic circuits, etc.).
+Return STRICT JSON:
 {"is_spectrum_plot": true|false,
- "plot_kind": "raman|xanes|xrd|absorption|pl|ftir|other|not_a_plot",
+ "plot_kind": "transmission|insertion_loss|reflection|s_parameter|coupling_efficiency|group_index|dispersion|other|not_a_plot",
  "n_panels": <int>,
  "panels": [{"bbox": [x0, y0, x1, y1], "label": "(a)" or null,
              "is_spectrum_plot": true|false}]}
-A "spectrum plot" is a line graph of intensity/absorption vs. an
-energy-like axis. If the figure is a single panel, n_panels is 1 and
-panels has one entry covering the whole image.
+
+A "spectrum plot" here means a digitizable 1-D line graph of a photonic
+device response (e.g. T, IL, R, |S21|, coupling efficiency, ER) versus
+wavelength, optical frequency, or a similar continuous sweep axis and NOT eye diagrams,
+IV curves, schematics, or micrographs.
+If the figure is a single panel, n_panels is 1 and panels has one entry
+covering the whole image. Mark each panel independently.
 """
+# scoping out 2d plots like eye diagrams right now. pretty sure paper I'm following can only handle 1D plots ;-;
 
 PROMPT_READ_TICKS = """\
 This image is a horizontal strip containing the tick labels of the {axis}-axis

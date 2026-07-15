@@ -1,107 +1,164 @@
-"""Pixel -> data coordinate calibration.               *** YOURS TO IMPLEMENT ***
+""" Maps pixel to (x,y) coordinate
 
-Inputs : AxesGeometry with x_ticks / y_ticks = [(px_i, v_i)] pairs, some
-         v_i possibly None or misread (OCR is fallible), scale hints
-         ("linear"/"log"/"unknown") from Claude that should be VERIFIED,
-         not trusted.
-Output : a Calibration that maps (col, row) pixel points to (x, y) data.
-
-Math to work out (roughly in order of difficulty):
-
-1. LINEAR AXIS, CLEAN TICKS.
-   Model v = a*px + b. With ticks {(px_i, v_i)}, least squares:
-       minimize  sum_i (a*px_i + b - v_i)^2
-   Normal equations give a, b in closed form. Two ticks determine the
-   map; more ticks overdetermine it -- that redundancy is your error
-   detector, don't throw it away by using only the endpoints.
-
-2. LOG AXIS DETECTION + FIT.
-   On a log axis, equal pixel steps multiply the value: v = 10^(a*px+b).
-   Detection: compare goodness-of-fit of regressing v on px vs.
-   log10(v) on px (require all v_i > 0 for the latter). Prefer a proper
-   criterion over raw R^2 -- both models have 2 parameters here, but
-   think about what residual distribution you're assuming in each space.
-   Cross-check against the Claude 'scale' hint; disagreement is worth a
-   warning in the report.
-
-3. ROBUSTNESS (the actually interesting part).
-   Failure modes to handle:
-     - one OCR value wrong (e.g. '8' read as '3'): a single gross outlier.
-       Options: RANSAC over tick pairs; or iterate LSQ with residual-based
-       rejection (|r_i| > k*MAD). With >= 4 ticks you can always identify
-       one bad value, since ticks are *equally spaced in data value* on a
-       linear axis -- exploit that structure: diff(v_i) should be constant.
-     - counts mismatch (n pixels != n values): match_ticks() zipped
-       best-effort. The consistent-spacing structure again identifies
-       the correct alignment: try each alignment offset, keep the one
-       with the lowest robust fit residual.
-     - value=None entries: just exclude from the fit.
-   Report per-axis: fitted params, residual RMS in data units, number of
-   rejected ticks. Downstream (and the future verify loop) uses this.
-
-4. Y-AXIS POLICY.
-   Spectra usually have arbitrary intensity units. If y ticks are absent
-   or unmatched, fall back to a normalized map: row -> [0, 1] over the
-   plot bbox (top row -> 1, x_axis_row -> 0). Flag it in the report.
-
-5. THE FLIP. Image rows increase downward; data y increases upward.
-   Handle it HERE and nowhere else (see models.py docstring).
-
-Suggested self-check: tests/test_calibration.py fabricates tick sets
-(clean, noisy, one-outlier, log) with known ground truth.
-"""
+Input: AxesGeometry
+Output: calibration that maps pixel point to (x,y) point"""
 
 from __future__ import annotations
-
+from multiprocessing import Value
+from numpy._typing._array_like import NDArray
 from dataclasses import dataclass, field
 from typing import Literal
-
 import numpy as np
-
 from .models import AxesGeometry
-
 
 @dataclass
 class AxisMap:
-    """One axis' pixel->data map: value = a*px + b (linear) or 10^(a*px+b) (log)."""
-
-    kind: Literal["linear", "log", "normalized"]
-    a: float
-    b: float
-
-    def to_data(self, px: np.ndarray) -> np.ndarray:
-        lin = self.a * np.asarray(px, dtype=float) + self.b
-        return 10.0 ** lin if self.kind == "log" else lin
-
+   """Linear map between pixel point and x,y point. of form a*px + b or 10^(a*px+b) for log plots"""
+   kind: Literal["linear", "log", "normalized"]
+   a: float
+   b: float
+   def to_data(self, px: np.ndarray) -> np.ndarray:
+      lin = self.a * np.asarray(px, dtype=float) + self.b
+      if self.kind == "log":
+         return 10.0 ** lin
+      else:
+         return lin
 
 @dataclass
 class Calibration:
-    x_map: AxisMap
-    y_map: AxisMap
-    report: dict = field(default_factory=dict)  # residuals, rejected ticks, warnings
+   x_map: AxisMap
+   y_map: AxisMap
+   report: dict = field(default_factory=dict)
 
-    def px_to_data(self, points_px: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """(N,2) array of (col, row) -> (x_data, y_data) arrays."""
-        return self.x_map.to_data(points_px[:, 0]), self.y_map.to_data(points_px[:, 1])
+   def px_to_data(self, points_px: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+      return (self.x_map.to_data(points_px[:, 0]), self.y_map.to_data(points_px[:, 1]))
 
 
-def fit_axis_map(ticks: list, scale_hint: str = "unknown") -> AxisMap:
-    """Fit one axis' map from [(px, value)] ticks. See module docstring.
+def _extract_useable(ticks: list) -> tuple[np.ndarray, np.ndarray]:
+   px, val = [], []
+   for t in ticks:
+      p = getattr(t, "px", None)
+      v = getattr(t, "value", None)
+      if p is None and isinstance(t, (tuple, list)):  # allow raw (px, value) pairs too
+         p, v = t[0], t[1]
+      if v is None:
+         continue
+      px.append(float(p))
+      val.append(float(v))
+   return np.asarray(px, float), np.asarray(val, float)
 
-    Must handle: value=None entries, a single gross OCR outlier,
-    log-axis detection (verify the hint, don't trust it).
-    Raise ValueError with a clear message if fewer than 2 usable ticks
-    survive rejection.
-    """
-    raise NotImplementedError("fit_axis_map: your calibration math goes here")
+
+def _least_square_regression(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+   A = np.vstack([x, np.ones_like(x)]).T
+   (a, b), *_ = np.linalg.lstsq(A, y, rcond=None)
+   return float(a), float(b)
+
+def _robust_line(x: np.ndarray, y: np.ndarray, k: float=3.5, max_iter: int=5) -> tuple[float, float, np.ndarray]:
+   # improve linear fit by throwing away terms that are far away from an initial linear fit. then rerun the fit. then throw away some more terms, etc. etc.
+   x = np.asarray(x, float)
+   y = np.asarray(y, float)
+   mask = np.ones(len(x), bool)
+   a, b = _least_square_regression(x, y)
+   y_scale = 1.0 + float(np.max(np.abs(y))) if len(y) else 1.0
+
+   for _ in range(max_iter):
+      a, b = _least_square_regression(x[mask], y[mask]) # np boolean mask
+      r = y - (a*x + b)                                 # residuals for ALL points, not just inliers
+      r_in = r[mask]
+      # robust noise scale from inlier residuals (1.4826 * MAD ~= sigma for Gaussian) --> google MAD.  1.4826 is 1/zscore. here 75 percentile score is used
+      sigma = 1.4826 * float(np.median(np.abs(r_in - np.median(r_in)))) 
+      if sigma < 1e-9 * y_scale:   # essentially a perfect fit; nothing to reject
+         break
+      new = np.abs(r) <= k * sigma  # keep points within k robust std of the line
+      if new.sum() < 2 or np.array_equal(new, mask):
+         if new.sum() >= 2:
+            mask: NDArray[numpy.bool[builtins.bool]] = new
+         break                      # converged, or can't reject below 2 points
+      mask = new
+
+   return a, b, mask
+
+def _median_rel_resid(v_pred: np.ndarray, v: np.ndarray) -> float:
+   # helper to decide whether to use log or linear plot. calculates median of relative error for every data point
+   # func later will choose smaller error
+   denom = np.where(np.abs(v) > 1e-12, np.abs(v), 1e-12) # divide by 0 guard
+   return float(np.median(np.abs(v_pred-v)/denom))
+
+
+def fit_axis_map(ticks: list, scale_hint: str="unknown", diagnostics: dict | None = None) -> AxisMap:
+   # fit one axis pixel->value map.
+   px, v = _extract_useable(ticks)
+   if len(px) < 2:
+      raise ValueError("need more axis data points. Less than 2 given.")
+   
+   # test linear scale
+   a_lin, b_lin, mask_lin = _robust_line(x=px, y=v)
+   v_lin = a_lin*px + b_lin
+   score_lin = _median_rel_resid(v_lin, v)
+
+   # test log scale
+   score_log = np.inf
+   a_log = b_log = None
+   mask_log = None
+   if np.all(v > 0):
+      a_log, b_log, mask_log = _robust_line(px, np.log10(v))
+      v_log = 10.0 ** (a_log * px + b_log)
+      score_log = _median_rel_resid(v_log, v)
+   
+   # pick smaller score
+
+   if score_log < score_lin:
+      kind, a, b, mask = "log", a_log, b_log, mask_log
+      v_pred = 10.0 ** (a * px + b)
+   else:
+      kind, a, b, mask = "linear", a_lin, b_lin, mask_lin
+      v_pred = a * px + b
+
+   # claude generated code that I'll keep:
+   if diagnostics is not None:
+      resid = v_pred[mask] - v[mask]
+      diagnostics.update(
+         kind=kind, a=a, b=b,
+         n_used=int(mask.sum()),
+         n_rejected=int((~mask).sum()),
+         resid_rms=float(np.sqrt(np.mean(resid ** 2))) if mask.any() else float("nan"),
+      )
+      warnings = diagnostics.setdefault("warnings", [])
+      if scale_hint in ("linear", "log") and scale_hint != kind:
+         warnings.append(f"scale hint was '{scale_hint}' but fit prefers '{kind}' "
+                         f"(rel-resid linear={score_lin:.2e}, log={score_log:.2e})")
+
+   return AxisMap(kind=kind, a=float(a), b=float(b))
+      
+
+def _normalized_y(geometry: AxesGeometry) -> AxisMap:
+   # claude generated func that's supposed to be failsafe in case y ticks are not useable. it normalizes the y axis based on end points
+   bottom = float(geometry.x_axis_row)
+   top = float(geometry.plot_bbox.y0)
+   if abs(top - bottom) < 1e-9:
+      raise ValueError("degenerate plot box: top row == x_axis_row")
+   a = 1.0 / (top - bottom)   # negative, since top row index < bottom
+   b = -a * bottom
+   return AxisMap(kind="normalized", a=a, b=b)
 
 
 def calibrate(geometry: AxesGeometry) -> Calibration:
-    """Build the full Calibration from AxesGeometry.
+   # build Calibration from AxesGeometry
+   report: dict = {"warnings": []}
 
-    - x axis: fit_axis_map(geometry.x_ticks, geometry.x_scale)
-    - y axis: fit_axis_map(...) if usable ticks exist, else the
-      normalized fallback (docstring item 4) using plot_bbox/x_axis_row.
-    - populate Calibration.report (fit residuals, rejections, warnings).
-    """
-    raise NotImplementedError("calibrate: your calibration math goes here")
+   x_diag: dict = {}
+   x_map = fit_axis_map(geometry.x_ticks, geometry.x_scale, x_diag)
+   report["x"] = x_diag
+   report["warnings"].extend(x_diag.get("warnings", []))
+
+   y_diag: dict = {}
+   try:
+      y_map = fit_axis_map(geometry.y_ticks, geometry.y_scale, diagnostics=y_diag)
+      report["y"] = y_diag
+      report["warnings"].extend(y_diag.get("warnings", []))
+   except ValueError as e:
+      y_map = _normalized_y(geometry)
+      report["y"] = {"kind": "normalized", "reason": str(e)}
+      report["warnings"].append("unable to calibrate y axis from ticks, used normalized [0,1] map")
+   
+   return Calibration(x_map, y_map, report)
